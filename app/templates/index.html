@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}上传数据 · 流式线性回归标定{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>上传实测数据</h1>
+  <p class="muted">
+    CSV 两列：第一列实测值 x，第二列参考值 y，可带表头（如 <code>x,y</code> 或 <code>实测值,参考值</code>）。
+    文件按行顺序分组，每组只做一次带动量的梯度更新，末组不足也更新。
+    “单次读入行数上限”控制峰值内存：训练时最多只在内存里保留这么多行。
+  </p>
+  <form method="post" action="{{ url_for('upload') }}" enctype="multipart/form-data" class="grid">
+    <label class="span2">CSV 文件
+      <input type="file" name="csv" accept=".csv,.txt,text/csv" required>
+      <small class="muted">最大 {{ max_upload_mb }} MB</small>
+    </label>
+    <label>每组样本数
+      <input type="number" name="group_size" min="1" step="1" value="1000" required>
+    </label>
+    <label>单次读入行数上限
+      <input type="number" name="chunk_limit" min="1" step="1" value="200" required>
+      <small class="muted">≤ 每组样本数时内存最省；小于每组时组内分多次读入并累积梯度</small>
+    </label>
+    <label>学习率
+      <input type="number" name="lr" step="any" value="0.001" required>
+    </label>
+    <label>动量系数
+      <input type="number" name="momentum" step="any" min="0" max="0.999999" value="0.9" required>
+    </label>
+    <label>初始 w
+      <input type="number" name="init_w" step="any" value="0" required>
+    </label>
+    <label>初始 b
+      <input type="number" name="init_b" step="any" value="0" required>
+    </label>
+    <div class="span2 actions">
+      <button type="submit" class="primary">上传并校验</button>
+    </div>
+  </form>
+</section>
+
+<section class="card">
+  <h2>训练记录</h2>
+  {% if runs %}
+  <table class="runs">
+    <thead>
+      <tr>
+        <th>#</th><th>文件</th><th>状态</th><th>更新次数</th>
+        <th>已计入样本 / 总行数</th><th>w</th><th>b</th><th>动量 (v_w, v_b)</th><th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in runs %}
+      <tr>
+        <td>{{ r.id }}</td>
+        <td class="mono">{{ r.original_name }}</td>
+        <td>{{ status_badge(r.status) }}</td>
+        <td>{{ r.updates_done }}</td>
+        <td>{{ r.samples_done }} / {{ r.total_rows }}</td>
+        <td class="mono">{{ '%.8g'|format(r.w) }}</td>
+        <td class="mono">{{ '%.8g'|format(r.b) }}</td>
+        <td class="mono">{{ '%.4g'|format(r.v_w) }}, {{ '%.4g'|format(r.v_b) }}</td>
+        <td><a href="{{ url_for('run_detail', run_id=r.id) }}">打开</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">还没有训练记录。</p>
+  {% endif %}
+</section>
+{% endblock %}

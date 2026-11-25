@@ -1,0 +1,122 @@
+{% extends "base.html" %}
+{% block title %}训练 #{{ run.id }} · 流式线性回归标定{% endblock %}
+{% block content %}
+<div id="run" data-run-id="{{ run.id }}"
+     data-worker-running="{{ '1' if worker_running else '0' }}"
+     data-status="{{ run.status }}">
+<section class="card">
+  <div class="headline">
+    <h1>训练 #{{ run.id }} · <span class="mono">{{ run.original_name }}</span></h1>
+    {{ status_badge(run.status) }}
+  </div>
+  <p class="muted" id="message">{{ run.message }}</p>
+
+  <div class="metrics">
+    <div class="metric"><span class="label">更新次数</span><span id="m-updates" class="value">{{ run.updates_done }}</span></div>
+    <div class="metric"><span class="label">已计入样本数</span><span id="m-samples" class="value">{{ run.samples_done }}</span>
+      <span class="muted">/ {{ run.total_rows }} 行</span></div>
+    <div class="metric"><span class="label">组内已读未更新</span><span id="m-part" class="value">{{ run.part_rows }}</span>
+      <span class="muted">行（暂停时已落盘）</span></div>
+    <div class="metric"><span class="label">w</span><span id="m-w" class="value mono">{{ '%.10g'|format(run.w) }}</span></div>
+    <div class="metric"><span class="label">b</span><span id="m-b" class="value mono">{{ '%.10g'|format(run.b) }}</span></div>
+    <div class="metric"><span class="label">动量 v_w</span><span id="m-vw" class="value mono">{{ '%.10g'|format(run.v_w) }}</span></div>
+    <div class="metric"><span class="label">动量 v_b</span><span id="m-vb" class="value mono">{{ '%.10g'|format(run.v_b) }}</span></div>
+  </div>
+  <div class="progress"><div id="bar" class="bar" style="width: {{ (100 * (run.samples_done + run.part_rows) / run.total_rows)|round(2) if run.total_rows else 0 }}%"></div></div>
+  <p class="muted small">
+    每组 {{ run.group_size }} 行 · 当前读取上限 {{ run.chunk_limit }} 行/次 · 累计已读段数 {{ run.chunks_read }} ·
+    学习率 {{ run.lr }} · 动量 {{ run.momentum }} ·
+    峰值同时驻留 {{ run.peak_rows_held }} 行 · 进程峰值 RSS {{ run.peak_rss_kb }} kB ·
+    上组用时 {{ '%.1f'|format(run.last_group_ms) }} ms
+  </p>
+  <details class="precise">
+    <summary>全精度数值（可与不中断训练逐位比对）</summary>
+    <pre id="precise-values">w = {{ '%.17g'|format(run.w) }}
+b = {{ '%.17g'|format(run.b) }}
+v_w = {{ '%.17g'|format(run.v_w) }}
+v_b = {{ '%.17g'|format(run.v_b) }}</pre>
+  </details>
+</section>
+
+<section class="card controls">
+  <h2>控制</h2>
+  <div class="control-grid">
+    <form method="post" action="{{ url_for('run_start', run_id=run.id) }}" class="inline"
+          onsubmit="return confirm('开始/继续该训练？');">
+      <label>读完后暂停的数量
+        <span class="pause-row">
+          <input type="number" name="pause_after" min="1" step="1" placeholder="留空 = 跑完" style="flex:1">
+          <select name="pause_unit" aria-label="暂停单位">
+            <option value="chunk" selected>读取段</option>
+            <option value="group">更新组</option>
+          </select>
+        </span>
+        <small class="muted">“段”=单次读入上限的块；“组”=每组样本数（一次更新）。从本次启动起算，暂停点落在边界，下次从下一行继续</small>
+      </label>
+      <label>单次读入上限（可改小）
+        <input type="number" name="chunk_limit" min="1" step="1" value="{{ run.chunk_limit }}">
+      </label>
+      <button type="submit" class="primary" {% if run.status in ['finished','failed'] or worker_running %}disabled{% endif %}>
+        {% if run.status in ['ready'] %}开始训练{% else %}继续训练{% endif %}
+      </button>
+    </form>
+
+    <form method="post" action="{{ url_for('run_pause', run_id=run.id) }}" class="inline"
+          onsubmit="return confirm('请求在当前读取段结束后暂停？');">
+      <button type="submit" {% if not worker_running %}disabled{% endif %}>主动暂停</button>
+      <small class="muted">当前读取段结束后落盘停止，下次从下一行续训</small>
+    </form>
+
+    <form method="post" action="{{ url_for('run_chunk_limit', run_id=run.id) }}" class="inline">
+      <label>暂停时调小读取上限
+        <input type="number" name="chunk_limit" min="1" step="1" value="{{ run.chunk_limit }}">
+      </label>
+      <button type="submit" {% if worker_running or run.status == 'finished' %}disabled{% endif %}>应用</button>
+    </form>
+
+    <form method="post" action="{{ url_for('run_delete', run_id=run.id) }}" class="inline"
+          onsubmit="return confirm('删除训练 #{{ run.id }} 的记录与数据文件？');">
+      <button type="submit" class="danger" {% if worker_running %}disabled{% endif %}>删除</button>
+      <a class="button" href="{{ url_for('download_upload', name=run.stored_name) }}">下载原始 CSV</a>
+    </form>
+  </div>
+</section>
+
+<section class="card">
+  <h2>最近更新（审计记录）</h2>
+  <table class="updates">
+    <thead>
+      <tr><th>#</th><th>样本数</th><th>梯度 g_w / g_b</th><th>w</th><th>b</th>
+          <th>v_w</th><th>v_b</th><th>均方误差</th><th>用时 ms</th></tr>
+    </thead>
+    <tbody id="updates-body">
+      {% for u in updates %}
+      <tr>
+        <td>{{ u.idx + 1 }}</td>
+        <td>{{ u.samples }}</td>
+        <td class="mono">{{ '%.6g'|format(u.grad_w) }} / {{ '%.6g'|format(u.grad_b) }}</td>
+        <td class="mono">{{ '%.10g'|format(u.w_after) }}</td>
+        <td class="mono">{{ '%.10g'|format(u.b_after) }}</td>
+        <td class="mono">{{ '%.6g'|format(u.v_w) }}</td>
+        <td class="mono">{{ '%.6g'|format(u.v_b) }}</td>
+        <td class="mono">{{ '%.6g'|format(u.loss_mean) }}</td>
+        <td>{{ '%.1f'|format(u.group_ms) }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="9" class="muted">尚无已提交的更新</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="muted small">
+    每行对应一次参数更新；参数、动量与已计入进度在同一事务中提交，因此该表就是可复核的更新轨迹。
+    <a href="{{ url_for('api_audit', run_id=run.id) }}">查看一致性审计 JSON</a>
+  </p>
+</section>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+  window.RUN_POLL_URL = "{{ url_for('api_run', run_id=run.id) }}";
+  window.RUN_PAGE_URL = "{{ url_for('run_detail', run_id=run.id) }}";
+</script>
+{% endblock %}

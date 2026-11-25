@@ -1,0 +1,25 @@
+services:
+  calibrator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: streaming-calibration:local
+    container_name: streaming-calibration
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    environment:
+      APP_SECRET_KEY: "${APP_SECRET_KEY:-local-compose-secret}"
+      APP_MAX_UPLOAD_MB: "${APP_MAX_UPLOAD_MB:-512}"
+      # Conservative SQLite/OS caches for small machines.
+      MALLOC_ARENA_MAX: "2"
+    volumes:
+      - calibration-data:/data
+    # Keep the container cheap on a small host: CPU threads + a hard memory cap.
+    cpus: "${APP_CPUS:-1.0}"
+    mem_limit: "${APP_MEM_LIMIT:-512m}"
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  calibration-data:
