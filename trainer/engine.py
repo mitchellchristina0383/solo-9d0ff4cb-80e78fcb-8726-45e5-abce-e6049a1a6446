@@ -48,6 +48,7 @@ import csv
 import hashlib
 import math
 import os
+import shutil
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -90,6 +91,13 @@ CREATE TABLE IF NOT EXISTS runs (
     peak_rows_held     INTEGER NOT NULL DEFAULT 0,
     peak_rss_kb        INTEGER NOT NULL DEFAULT 0,
     last_group_ms      REAL NOT NULL DEFAULT 0,
+    parent_run_id      INTEGER REFERENCES runs(id),   -- continuation: run whose data comes first
+    reused_updates     INTEGER NOT NULL DEFAULT 0,    -- complete groups copied from the parent
+    reused_samples     INTEGER NOT NULL DEFAULT 0,
+    incr_stored_name   TEXT,                          -- the uploaded headerless increment CSV
+    incr_file_sha256   TEXT,
+    incr_rows          INTEGER NOT NULL DEFAULT 0,
+    seam_padding       INTEGER NOT NULL DEFAULT 0,    -- newline bytes inserted between the two files
     created_at         TEXT NOT NULL,
     updated_at         TEXT NOT NULL,
     finished_at        TEXT
@@ -133,6 +141,13 @@ _ADDED_COLUMNS = {
     "peak_rows_held": "INTEGER NOT NULL DEFAULT 0",
     "peak_rss_kb": "INTEGER NOT NULL DEFAULT 0",
     "last_group_ms": "REAL NOT NULL DEFAULT 0",
+    "parent_run_id": "INTEGER",
+    "reused_updates": "INTEGER NOT NULL DEFAULT 0",
+    "reused_samples": "INTEGER NOT NULL DEFAULT 0",
+    "incr_stored_name": "TEXT",
+    "incr_file_sha256": "TEXT",
+    "incr_rows": "INTEGER NOT NULL DEFAULT 0",
+    "seam_padding": "INTEGER NOT NULL DEFAULT 0",
 }
 
 
@@ -264,6 +279,102 @@ def sha256_file(path: str) -> str:
         for block in iter(lambda: fh.read(1 << 20), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def scan_increment_file(path: str) -> FileMeta:
+    """Validate a headerless two-column increment CSV and count its rows.
+
+    Unlike :func:`scan_file`, a non-numeric first line is rejected rather than
+    treated as a header: increments must contain data rows only.  The same
+    per-row validation (two finite numeric columns, blank lines skipped, line
+    length cap) applies, and the whole file is streamed so memory stays bounded.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError as exc:
+        raise InputError(f"无法读取文件: {exc}") from exc
+    if size == 0:
+        raise InputError("增量文件为空")
+    rows = 0
+    data_start: Optional[int] = None
+    with open(path, "rb") as fh:
+        lineno = 0
+        first_data = True
+        while True:
+            start = fh.tell()
+            raw = read_line(fh)
+            if not raw:
+                break
+            lineno += 1
+            text = decode_line(raw).strip()
+            if not text:
+                continue
+            if first_data:
+                first_data = False
+                cols = next(csv.reader([text]))
+                if len(cols) != 2:
+                    raise InputError(
+                        f"增量文件第 {lineno} 行应有 2 列（实测值、参考值），实际 {len(cols)} 列"
+                    )
+                try:
+                    x0, y0 = float(cols[0]), float(cols[1])
+                except ValueError as exc:
+                    raise InputError(
+                        f"增量文件不允许表头：第 {lineno} 行不是数值（增量 CSV 须为无表头的两列数据）"
+                    ) from exc
+                if not (math.isfinite(x0) and math.isfinite(y0)):
+                    raise InputError(f"增量文件第 {lineno} 行含 NaN/Inf")
+                data_start = start
+                rows += 1
+                continue
+            parse_pair(text, lineno)
+            rows += 1
+    if data_start is None:
+        raise InputError("增量文件中没有可读内容")
+    return FileMeta(data_start=data_start, rows=rows, has_header=False)
+
+
+@dataclass(frozen=True)
+class MergeInfo:
+    size: int
+    seam_padding: int
+    sha256: str
+
+
+def merge_csv_streaming(parent_path: str, parent_data_start: int,
+                        incr_path: str, incr_data_start: int,
+                        out_path: str) -> MergeInfo:
+    """Concatenate parent data followed by increment data, byte-preserving.
+
+    Both segments are copied as raw bytes in 1 MiB blocks (no row is ever held
+    in memory), so every parent line keeps its exact byte representation and
+    the merged parent section is identical to training on the original file.
+    If the parent segment does not end with a newline, one ``\\n`` is inserted
+    at the seam so the rows cannot fuse.  A UTF-8 BOM at the start of the
+    increment file is skipped (the merge itself carries no BOM).
+    """
+    padding = 0
+    with open(parent_path, "rb") as src, open(out_path, "wb") as dst:
+        src.seek(parent_data_start)
+        shutil.copyfileobj(src, dst, length=1 << 20)
+        if dst.tell() > 0:
+            dst.flush()
+            with open(out_path, "rb") as check:
+                check.seek(-1, os.SEEK_END)
+                last = check.read(1)
+            if last not in (b"\n", b"\r"):
+                dst.write(b"\n")
+                padding = 1
+        with open(incr_path, "rb") as inc:
+            inc.seek(incr_data_start)
+            # skip a BOM sitting exactly at the increment's data start
+            head = inc.read(3)
+            if head != b"\xef\xbb\xbf":
+                inc.seek(incr_data_start)
+            shutil.copyfileobj(inc, dst, length=1 << 20)
+    size = os.path.getsize(out_path)
+    return MergeInfo(size=size, seam_padding=padding,
+                     sha256=sha256_file(out_path))
 
 
 # --------------------------------------------------------------------------- #
@@ -435,12 +546,195 @@ def create_run(
         return int(cur.lastrowid)
 
 
+# --------------------------------------------------------------------------- #
+# Incremental continuation
+# --------------------------------------------------------------------------- #
+def create_continuation(
+    conn: sqlite3.Connection,
+    parent_id: int,
+    parent_data_path: str,
+    incr_upload_path: str,
+    incr_original_name: str,
+    incr_stored_name: str,
+    merged_stored_name: str,
+    merged_abs_path: str,
+) -> int:
+    """Create a continuation run from a validated headerless increment CSV.
+
+    The merged data stream is *parent rows first, increment rows after*.
+    Complete groups of the finished parent are reused verbatim (audit rows
+    copied, their gradient work never redone).  If the parent ended on an
+    incomplete group, that partial group is *not* reused: the new run restarts
+    at the parameters/momentum captured just before that group began and
+    re-reads its old rows together with the increment before regrouping.
+
+    Everything required to resume -- the merged file, the copied audit rows and
+    the continuation checkpoint -- is committed in one transaction; on any
+    failure the partially written merged file is removed and no run appears.
+    """
+    parent = get_run(conn, parent_id)
+    if parent["status"] != "finished":
+        raise InputError(
+            f"原作业 #{parent_id} 尚未完成（当前状态：{parent['status']}），"
+            "增量续训只能基于已完成的作业"
+        )
+    sibling = conn.execute(
+        "SELECT id FROM runs WHERE parent_run_id=?", (parent_id,)
+    ).fetchone()
+    if sibling:
+        raise InputError(
+            f"原作业 #{parent_id} 已创建过续训作业（#{sibling['id']}），"
+            "请在该作业上继续追加，避免同一份数据产生分叉"
+        )
+    _verify_file(parent, parent_data_path)
+    incr_meta = scan_increment_file(incr_upload_path)
+    incr_digest = sha256_file(incr_upload_path)
+
+    parent_total = int(parent["total_rows"])
+    group_size = int(parent["group_size"])
+    full_groups, part_rows_parent = divmod(parent_total, group_size)
+    if part_rows_parent == 0:
+        reused_updates = int(parent["updates_done"])
+        if reused_updates != full_groups:
+            raise InputError("原作业的更新次数与完整组数不一致，拒绝续训")
+    else:
+        reused_updates = full_groups
+    reused_samples = reused_updates * group_size
+
+    # The parent audit must be internally sound before we copy any of it.
+    parent_audit = audit(conn, parent_id)
+    if not parent_audit["ok"]:
+        raise InputError(
+            "原作业的逐组审计未通过，拒绝在此基础上续训："
+            + "；".join(parent_audit["problems"][:3])
+        )
+
+    try:
+        info = merge_csv_streaming(
+            parent_data_path, int(parent["data_start"]),
+            incr_upload_path, int(incr_meta.data_start),
+            merged_abs_path,
+        )
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            os.unlink(merged_abs_path)
+        raise InputError(f"写入合并数据文件失败: {exc}") from exc
+
+    try:
+        merged_meta = scan_file(merged_abs_path)
+        if merged_meta.rows != parent_total + int(incr_meta.rows):
+            raise InputError(
+                f"合并后行数校验失败：期望 {parent_total + incr_meta.rows}，"
+                f"实际 {merged_meta.rows}"
+            )
+        merged_size = os.path.getsize(merged_abs_path)
+        merged_digest = sha256_file(merged_abs_path)
+
+        # Byte layout inside the merged file.  The parent section starts at 0.
+        parent_section_len = int(parent["file_size"]) - int(parent["data_start"])
+        shift = -int(parent["data_start"])
+        reused_rows = conn.execute(
+            "SELECT * FROM updates WHERE run_id=? ORDER BY idx LIMIT ?",
+            (parent_id, reused_updates),
+        ).fetchall()
+        if len(reused_rows) != reused_updates:
+            raise InputError("原作业可沿用的组记录数量不足，拒绝续训")
+
+        if part_rows_parent == 0:
+            # Resume right after the reused groups; the optional seam newline is
+            # blank and skipped by the reader.
+            last = reused_rows[-1]
+            next_offset = int(last["offset_after"]) + shift + info.seam_padding
+            init_w = float(parent["w"])
+            init_b = float(parent["b"])
+            w0, b0, vw0, vb0 = (
+                float(parent["w"]), float(parent["b"]),
+                float(parent["v_w"]), float(parent["v_b"]),
+            )
+            part = Part()
+        else:
+            # Discard the unfinished partial group: restart at the checkpoint
+            # just before it (state captured in the last reused audit row).
+            if reused_updates > 0:
+                last = reused_rows[-1]
+                w0 = float(last["w_after"])
+                b0 = float(last["b_after"])
+                vw0 = float(last["v_w"])
+                vb0 = float(last["v_b"])
+                next_offset = int(last["offset_after"]) + shift
+            else:
+                w0 = float(parent["init_w"])
+                b0 = float(parent["init_b"])
+                vw0 = vb0 = 0.0
+                next_offset = 0
+            init_w, init_b = float(parent["init_w"]), float(parent["init_b"])
+            part = Part(start_offset=next_offset)
+            # Sanity: the parent's partial rows must all lie before the seam.
+            if next_offset > parent_section_len:
+                raise InputError("原作业断点位置异常，拒绝续训")
+
+        now = _now()
+        new_original = (
+            f"{os.path.splitext(parent['original_name'])[0]}"
+            f"+{os.path.basename(incr_original_name)}"
+        )[:200]
+        with transaction(conn):
+            cur = conn.execute(
+                """INSERT INTO runs(original_name, stored_name, file_size, file_sha256,
+                                    data_start, has_header, total_rows, group_size, chunk_limit,
+                                    lr, momentum, init_w, init_b, w, b, v_w, v_b,
+                                    next_offset, samples_done, updates_done,
+                                    part_rows, part_gw, part_gb, part_loss, part_start_offset,
+                                    status, message,
+                                    peak_rows_held, peak_rss_kb,
+                                    parent_run_id, reused_updates, reused_samples,
+                                    incr_stored_name, incr_file_sha256, incr_rows, seam_padding,
+                                    created_at, updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (new_original, merged_stored_name, merged_size, merged_digest,
+                 merged_meta.data_start, 1 if merged_meta.has_header else 0,
+                 merged_meta.rows, group_size, int(parent["chunk_limit"]),
+                 float(parent["lr"]), float(parent["momentum"]),
+                 init_w, init_b, w0, b0, vw0, vb0,
+                 next_offset, reused_samples, reused_updates,
+                 part.rows, part.gw, part.gb, part.loss, part.start_offset,
+                 "ready",
+                 (f"已从作业 #{parent_id} 续建：沿用 {reused_updates} 个完整组"
+                  + ("" if part_rows_parent == 0 else
+                     f"，末组 {part_rows_parent} 行未满，已回退到该组之前重新分组")),
+                 int(parent["peak_rows_held"]), int(parent["peak_rss_kb"]),
+                 parent_id, reused_updates, reused_samples,
+                 incr_stored_name, incr_digest, int(incr_meta.rows),
+                 int(info.seam_padding), now, now),
+            )
+            new_id = int(cur.lastrowid)
+            for rec in reused_rows:
+                conn.execute(
+                    """INSERT INTO updates(run_id, idx, samples, offset_before, offset_after,
+                                           w_before, b_before, grad_w, grad_b, loss_mean,
+                                           v_w, v_b, w_after, b_after, group_ms, created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (new_id, int(rec["idx"]), int(rec["samples"]),
+                     int(rec["offset_before"]) + shift,
+                     int(rec["offset_after"]) + shift,
+                     float(rec["w_before"]), float(rec["b_before"]),
+                     float(rec["grad_w"]), float(rec["grad_b"]),
+                     float(rec["loss_mean"]), float(rec["v_w"]), float(rec["v_b"]),
+                     float(rec["w_after"]), float(rec["b_after"]),
+                     float(rec["group_ms"]), now),
+                )
+        return new_id
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(merged_abs_path)
+        raise
+
+
 def get_run(conn: sqlite3.Connection, run_id: int) -> sqlite3.Row:
     row = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
     if row is None:
         raise InputError(f"训练 #{run_id} 不存在")
     return row
-
 
 def list_runs(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute("SELECT * FROM runs ORDER BY id DESC").fetchall()
@@ -877,6 +1171,12 @@ def delete_run(conn: sqlite3.Connection, run_id: int) -> sqlite3.Row:
         return row
 
 
+def extra_files(row: sqlite3.Row) -> list[str]:
+    """On-disk files belonging to a run beyond its main data file."""
+    names = [row["incr_stored_name"]] if row["incr_stored_name"] else []
+    return [n for n in names if not os.path.isabs(n)]
+
+
 # --------------------------------------------------------------------------- #
 # Verification helpers
 # --------------------------------------------------------------------------- #
@@ -926,13 +1226,38 @@ def reference_fit(
     }
 
 
-def audit(conn: sqlite3.Connection, run_id: int) -> dict:
-    """Replay the update chain and check parameters, momentum and progress agree."""
+def _gap_is_blank_lines(data_path: str, lo: int, hi: int) -> bool:
+    """True when bytes ``[lo, hi)`` of the file are all blank lines.
+
+    A continuation merge may insert one newline between the parent data and the
+    increment; that seam is the only legitimate gap between consecutive audit
+    offsets.
+    """
+    if hi <= lo:
+        return False
+    try:
+        with open(data_path, "rb") as fh:
+            fh.seek(lo)
+            chunk = fh.read(hi - lo)
+    except OSError:
+        return False
+    if len(chunk) != hi - lo:
+        return False
+    return all(decode_line(line).strip() == "" for line in chunk.splitlines(keepends=True))
+
+
+def audit(conn: sqlite3.Connection, run_id: int, data_path: Optional[str] = None) -> dict:
+    """Replay the update chain and check parameters, momentum and progress agree.
+
+    When ``data_path`` is supplied, byte-offset gaps between consecutive audit
+    rows are checked against the file: they may only consist of blank lines
+    (e.g. the seam newline of an incremental merge).
+    """
     run = get_run(conn, run_id)
     rows = conn.execute(
         "SELECT * FROM updates WHERE run_id=? ORDER BY idx", (run_id,)
     ).fetchall()
-    w, b, v_w, v_b = run["init_w"], run["init_b"], 0.0, 0.0
+    reused = int(run["reused_updates"] or 0)
     problems: list[str] = []
     samples = 0
     prev_offset = int(run["data_start"])
@@ -940,17 +1265,45 @@ def audit(conn: sqlite3.Connection, run_id: int) -> dict:
         if rec["idx"] != expect:
             problems.append(f"更新序号不连续：期望 {expect}，实际 {rec['idx']}")
         if rec["offset_before"] != prev_offset:
-            problems.append(f"更新 {rec['idx']} 的起始偏移与上次结束偏移不衔接")
+            if data_path is not None and _gap_is_blank_lines(
+                data_path, prev_offset, int(rec["offset_before"])
+            ):
+                pass  # legitimate blank-line seam (incremental continuation)
+            else:
+                problems.append(f"更新 {rec['idx']} 的起始偏移与上次结束偏移不衔接")
         prev_offset = int(rec["offset_after"])
         samples += int(rec["samples"])
-        v_w = run["momentum"] * v_w - run["lr"] * rec["grad_w"]
-        v_b = run["momentum"] * v_b - run["lr"] * rec["grad_b"]
-        w += v_w
-        b += v_b
-        if not (w == rec["w_after"] and b == rec["b_after"]):
-            problems.append(f"更新 {rec['idx']} 的参数与审计记录不一致")
-        if not (v_w == rec["v_w"] and v_b == rec["v_b"]):
-            problems.append(f"更新 {rec['idx']} 的动量与审计记录不一致")
+
+    if reused > 0:
+        # Continuation run: the reused groups were copied from the parent audit
+        # (already verified at creation).  Replay only the newly computed groups,
+        # starting from the state captured at the reused checkpoint.
+        if reused > len(rows):
+            problems.append(f"沿用组数 {reused} 超过审计记录数 {len(rows)}")
+            reused = len(rows)
+        checkpoint = rows[reused - 1]
+        w, b = float(checkpoint["w_after"]), float(checkpoint["b_after"])
+        v_w, v_b = float(checkpoint["v_w"]), float(checkpoint["v_b"])
+        for rec in rows[reused:]:
+            v_w = run["momentum"] * v_w - run["lr"] * rec["grad_w"]
+            v_b = run["momentum"] * v_b - run["lr"] * rec["grad_b"]
+            w += v_w
+            b += v_b
+            if not (w == rec["w_after"] and b == rec["b_after"]):
+                problems.append(f"更新 {rec['idx']} 的参数与审计记录不一致")
+            if not (v_w == rec["v_w"] and v_b == rec["v_b"]):
+                problems.append(f"更新 {rec['idx']} 的动量与审计记录不一致")
+    else:
+        w, b, v_w, v_b = run["init_w"], run["init_b"], 0.0, 0.0
+        for rec in rows:
+            v_w = run["momentum"] * v_w - run["lr"] * rec["grad_w"]
+            v_b = run["momentum"] * v_b - run["lr"] * rec["grad_b"]
+            w += v_w
+            b += v_b
+            if not (w == rec["w_after"] and b == rec["b_after"]):
+                problems.append(f"更新 {rec['idx']} 的参数与审计记录不一致")
+            if not (v_w == rec["v_w"] and v_b == rec["v_b"]):
+                problems.append(f"更新 {rec['idx']} 的动量与审计记录不一致")
     if samples != run["samples_done"]:
         problems.append(f"样本累计不一致：审计 {samples}，进度 {run['samples_done']}")
     if len(rows) != run["updates_done"]:
@@ -966,7 +1319,12 @@ def audit(conn: sqlite3.Connection, run_id: int) -> dict:
         problems.append("已计入样本 + 未成组行数超过总行数")
     if part_rows == 0:
         if run["next_offset"] != prev_offset:
-            problems.append("next_offset 与最后一条更新记录不一致")
+            if data_path is not None and _gap_is_blank_lines(
+                data_path, prev_offset, int(run["next_offset"])
+            ):
+                pass  # blank-line seam before the first not-yet-read row
+            else:
+                problems.append("next_offset 与最后一条更新记录不一致")
         if int(run["part_gw"]) != 0 or int(run["part_loss"]) != 0:
             problems.append("未成组累计应为空")
     else:

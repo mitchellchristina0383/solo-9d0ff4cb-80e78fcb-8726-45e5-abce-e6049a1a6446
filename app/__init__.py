@@ -217,7 +217,11 @@ def create_app(config: dict | None = None) -> Flask:
     def api_audit(run_id: int):
         with db() as conn:
             try:
-                result = engine.audit(conn, run_id)
+                run = engine.get_run(conn, run_id)
+                data_path = engine.resolve_data_path(
+                    app.config["UPLOAD_DIR"], run["stored_name"]
+                )
+                result = engine.audit(conn, run_id, data_path)
             except engine.InputError:
                 abort(404)
         result["run"] = dict(result["run"])
@@ -306,8 +310,62 @@ def create_app(config: dict | None = None) -> Flask:
                 return redirect(url_for("run_detail", run_id=run_id))
         with contextlib.suppress(OSError):
             os.unlink(engine.resolve_data_path(app.config["UPLOAD_DIR"], row["stored_name"]))
+        for extra in engine.extra_files(row):
+            with contextlib.suppress(OSError):
+                os.unlink(os.path.join(app.config["UPLOAD_DIR"], extra))
         flash(f"已删除训练 #{run_id} 的记录与数据文件", "ok")
         return redirect(url_for("index"))
+
+    @app.post("/runs/<int:run_id>/continue")
+    def run_continue(run_id: int):
+        file = request.files.get("incr_csv")
+        if file is None or not file.filename:
+            flash("请选择无表头的两列增量 CSV 文件", "error")
+            return redirect(url_for("run_detail", run_id=run_id))
+        original = os.path.basename(file.filename.replace("\\", "/")).strip()[:200]
+        ext = os.path.splitext(original)[1].lower()
+        if ext not in ALLOWED_EXT:
+            flash("增量文件只支持 .csv / .txt", "error")
+            return redirect(url_for("run_detail", run_id=run_id))
+        stem = secure_filename(os.path.splitext(original)[0]) or "increment"
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+        token = f"{stamp}-{os.getpid()}-{time.monotonic_ns()}"
+        incr_stored = f"{token}-incr-{stem}{ext}"
+        merged_stored = f"{token}-merged.csv"
+        incr_path = os.path.join(app.config["UPLOAD_DIR"], incr_stored)
+        merged_path = os.path.join(app.config["UPLOAD_DIR"], merged_stored)
+        file.save(incr_path)
+        try:
+            with db() as conn:
+                try:
+                    parent = engine.get_run(conn, run_id)
+                    parent_path = engine.resolve_data_path(
+                        app.config["UPLOAD_DIR"], parent["stored_name"]
+                    )
+                    new_id = engine.create_continuation(
+                        conn, run_id, parent_path,
+                        incr_path, original, incr_stored,
+                        merged_stored, merged_path,
+                    )
+                except engine.InputError as exc:
+                    # Validation/save failure: nothing new may be visible; the
+                    # original run stays untouched and fully viewable.
+                    for stray in (merged_path, incr_path):
+                        with contextlib.suppress(OSError):
+                            os.unlink(stray)
+                    flash(f"增量续训未创建：{exc}", "error")
+                    return redirect(url_for("run_detail", run_id=run_id))
+        except BaseException:
+            for stray in (merged_path, incr_path):
+                with contextlib.suppress(OSError):
+                    os.unlink(stray)
+            raise
+        flash(
+            "增量数据校验通过，沿用的组记录与续训断点已落盘，"
+            f"已创建续训作业 #{new_id}（旧样本在前、新样本在后）。",
+            "ok",
+        )
+        return redirect(url_for("run_detail", run_id=new_id))
 
     @app.get("/uploads/<path:name>")
     def download_upload(name: str):

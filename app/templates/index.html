@@ -52,7 +52,9 @@
       {% for r in runs %}
       <tr>
         <td>{{ r.id }}</td>
-        <td class="mono">{{ r.original_name }}</td>
+        <td class="mono">{{ r.original_name }}
+          {% if r.parent_run_id %}<br><small class="muted">续训自 #{{ r.parent_run_id }}（沿用 {{ r.reused_updates }} 组 / {{ r.reused_samples }} 行，新增 {{ r.incr_rows }} 行）</small>{% endif %}
+        </td>
         <td>{{ status_badge(r.status) }}</td>
         <td>{{ r.updates_done }}</td>
         <td>{{ r.samples_done }} / {{ r.total_rows }}</td>

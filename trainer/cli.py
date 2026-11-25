@@ -57,6 +57,15 @@ def main(argv: list[str] | None = None) -> int:
     a2.add_argument("--db", required=True)
     a2.add_argument("--run-id", type=int, required=True)
 
+    c = sub.add_parser("continue", help="基于已完成作业和增量 CSV 创建续训作业")
+    c.add_argument("--db", required=True)
+    c.add_argument("--parent-id", type=int, required=True)
+    c.add_argument("--parent-data", required=True, help="原作业数据文件路径")
+    c.add_argument("--incr", required=True, help="无表头的两列增量 CSV")
+    c.add_argument("--upload-dir", required=True, help="合并文件写入目录")
+    c.add_argument("--name", default=None)
+    c.add_argument("--json", action="store_true")
+
     args = p.parse_args(argv)
 
     if args.cmd == "reference":
@@ -80,6 +89,32 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "show":
             print(json.dumps(dict(engine.get_run(conn, args.run_id)),
                              indent=2, ensure_ascii=False))
+            return 0
+        if args.cmd == "continue":
+            import time
+            incr_name = args.name or os.path.basename(args.incr)
+            token = time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + f"-{os.getpid()}"
+            incr_stored = f"{token}-incr-{os.path.basename(incr_name)}"
+            merged_stored = f"{token}-merged.csv"
+            merged_path = os.path.join(args.upload_dir, merged_stored)
+            os.makedirs(args.upload_dir, exist_ok=True)
+            new_id = engine.create_continuation(
+                conn, args.parent_id, args.parent_data,
+                args.incr, incr_name, incr_stored,
+                merged_stored, merged_path,
+            )
+            row = engine.get_run(conn, new_id)
+            print(json.dumps({
+                "run_id": new_id,
+                "status": row["status"],
+                "reused_updates": row["reused_updates"],
+                "reused_samples": row["reused_samples"],
+                "total_rows": row["total_rows"],
+                "updates_done": row["updates_done"],
+                "samples_done": row["samples_done"],
+                "part_rows": row["part_rows"],
+                "merged_file": merged_path,
+            }, indent=2, ensure_ascii=False))
             return 0
         if args.cmd == "train":
             run_id = args.run_id

@@ -11,6 +11,14 @@
   </div>
   <p class="muted" id="message">{{ run.message }}</p>
 
+  {% if run.parent_run_id %}
+  <p class="lineage">
+    续训自作业 <a href="{{ url_for('run_detail', run_id=run.parent_run_id) }}">#{{ run.parent_run_id }}</a>：
+    沿用 {{ run.reused_updates }} 个完整组（{{ run.reused_samples }} 个旧样本，跳过这些组的梯度计算），
+    合并数据共 {{ run.total_rows }} 行（旧样本在前、新增 {{ run.incr_rows }} 行在后）。
+  </p>
+  {% endif %}
+
   <div class="metrics">
     <div class="metric"><span class="label">更新次数</span><span id="m-updates" class="value">{{ run.updates_done }}</span></div>
     <div class="metric"><span class="label">已计入样本数</span><span id="m-samples" class="value">{{ run.samples_done }}</span>
@@ -81,6 +89,29 @@ v_b = {{ '%.17g'|format(run.v_b) }}</pre>
     </form>
   </div>
 </section>
+
+{% if run.status == 'finished' %}
+<section class="card controls">
+  <h2>增量续训（标定数据分批到齐）</h2>
+  <p class="muted small">
+    上传<strong>无表头的两列增量 CSV</strong>（每行 <code>x,y</code>，空行跳过）。系统会按
+    “旧样本在前、新样本在后”生成合并数据，并另建一个同配置续训作业：
+    已完成的完整组直接沿用审计记录与训练进度、<strong>跳过这些组的梯度计算</strong>；
+    若本作业末组未满，新作业从该组开始前的参数与动量继续，把旧末组样本与新增样本重新分组。
+    参数、动量与逐组数值与合并后从头训练<strong>逐位一致</strong>，且内存占用不随样本总数增长。
+    仅当增量数据通过校验、沿用记录与续训断点均已保存后才会出现新作业；失败时本作业照常可查。
+    每个作业最多续建一次，分批数据由此形成一条可逐级追溯的线性链。
+  </p>
+  <form method="post" action="{{ url_for('run_continue', run_id=run.id) }}"
+        enctype="multipart/form-data" class="inline"
+        onsubmit="return confirm('校验增量 CSV 并创建同配置续训作业？');">
+    <label>增量 CSV（无表头，两列）
+      <input type="file" name="incr_csv" accept=".csv,.txt,text/csv" required>
+    </label>
+    <button type="submit" class="primary">校验并创建续训作业</button>
+  </form>
+</section>
+{% endif %}
 
 <section class="card">
   <h2>最近更新（审计记录）</h2>
